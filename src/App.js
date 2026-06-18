@@ -3,6 +3,7 @@ import { onAuthStateChanged } from "firebase/auth";
 import { auth } from "./Firebase";
 import { motion } from "framer-motion";
 
+
 import Header from "./components/Header";
 import StatusMessage from "./components/StatusMessage";
 import ActionButtons from "./components/ActionButtons";

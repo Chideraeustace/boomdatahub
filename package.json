@@ -7,6 +7,7 @@
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@testing-library/user-event": "^13.5.0",
+    "analytics": "github:vercel/analytics",
     "firebase": "^12.15.0",
     "framer-motion": "^12.40.0",
     "react": "^19.2.7",
@@ -16,6 +17,7 @@
     "react-router-dom": "^7.18.0",
     "react-scripts": "5.0.1",
     "uuid": "^14.0.0",
+    "vercel": "^54.14.2",
     "web-vitals": "^2.1.4"
   },
   "scripts": {
