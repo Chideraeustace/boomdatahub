@@ -2,6 +2,7 @@ import React, { useState, useEffect } from "react";
 import { onAuthStateChanged } from "firebase/auth";
 import { auth } from "./Firebase";
 import { motion } from "framer-motion";
+import { Analytics } from "@vercel/analytics/react";
 
 import Header from "./components/Header";
 import StatusMessage from "./components/StatusMessage";
@@ -134,6 +135,8 @@ function App() {
         onClose={closeModal}
         setStatusMessage={setStatusMessage}
       />
+
+      <Analytics />
     </div>
   );
 }
