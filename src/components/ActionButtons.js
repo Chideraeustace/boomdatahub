@@ -119,7 +119,7 @@ const ActionButtons = ({ onCheckData, setStatusMessage }) => {
                 <strong>Enter your phone number below</strong> to link it and
                 start using{" "}
                 <span className="font-mono text-emerald-400">*919*111#</span>{" "}
-                without internet.
+                for offline data buying.
               </p>
             </div>
           </div>
