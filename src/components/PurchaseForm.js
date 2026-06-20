@@ -17,15 +17,15 @@ const providersData = {
     border: "border-[#FFCC00]",
     text: "text-black",
     bundles: [
-      { gb: 1, price: 5.3 },
-      { gb: 2, price: 10.0 },
+      { gb: 1, price: 4.8 },
+      { gb: 2, price: 9.5 },
       { gb: 3, price: 15.0 },
       { gb: 4, price: 20.0 },
-      { gb: 5, price: 25.0 },
-      { gb: 6, price: 30.0 },
-      { gb: 8, price: 39.0 },
-      { gb: 10, price: 45.0 },
-      { gb: 15, price: 64.0 },
+      { gb: 5, price: 24.0 },
+      { gb: 6, price: 29.0 },
+      { gb: 8, price: 37.0 },
+      { gb: 10, price: 44.0 },
+      { gb: 15, price: 62.0 },
       { gb: 20, price: 84.0 },
       { gb: 25, price: 104.0 },
       { gb: 30, price: 120.0 },
@@ -119,7 +119,7 @@ const mtnSpecialOffers = [
 ];
 
 const PurchaseForm = ({ setStatusMessage }) => {
-  const isSpecialOfferAvailable = true;
+  const isSpecialOfferAvailable = false;
 
   const [purchaseType, setPurchaseType] = useState("regular");
   const [selectedProvider, setSelectedProvider] = useState("mtn");
