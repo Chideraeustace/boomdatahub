@@ -17,20 +17,20 @@ const providersData = {
     border: "border-[#FFCC00]",
     text: "text-black",
     bundles: [
-      { gb: 1, price: 4.8 },
-      { gb: 2, price: 9.5 },
+      { gb: 1, price: 5.0 },
+      { gb: 2, price: 10.0 },
       { gb: 3, price: 15.0 },
       { gb: 4, price: 20.0 },
-      { gb: 5, price: 24.0 },
-      { gb: 6, price: 29.0 },
+      { gb: 5, price: 25.0 },
+      { gb: 6, price: 30.0 },
       { gb: 8, price: 37.0 },
       { gb: 10, price: 44.0 },
-      { gb: 15, price: 62.0 },
+      { gb: 15, price: 64.0 },
       { gb: 20, price: 84.0 },
       { gb: 25, price: 104.0 },
-      { gb: 30, price: 120.0 },
-      { gb: 40, price: 159.0 },
-      { gb: 50, price: 196.0 },
+      { gb: 30, price: 124.0 },
+      { gb: 40, price: 160.0 },
+      { gb: 50, price: 200.0 },
     ],
   },
   airtel: {
@@ -58,11 +58,13 @@ const providersData = {
     text: "text-white",
     bundles: [
       { gb: 5, price: 25.0 },
-      { gb: 10, price: 45.0 },
-      { gb: 15, price: 60.0 },
+      { gb: 10, price: 50.0 },
+      { gb: 15, price: 66.0 },
       { gb: 20, price: 85.0 },
-      { gb: 25, price: 100.0 },
-      { gb: 30, price: 120.0 },
+      { gb: 25, price: 105.0 },
+      { gb: 30, price: 123.0 },
+      { gb: 40, price: 160.0 },
+      { gb: 50, price: 200.0 },
     ],
   },
 };
@@ -130,8 +132,8 @@ const PurchaseForm = ({ setStatusMessage }) => {
   const [recipientPhoneNumber, setRecipientPhoneNumber] = useState("");
   const [isPaymentLoading, setIsPaymentLoading] = useState(false);
 
-  const startMoolrePayment = useMemo(
-    () => httpsCallable(functions, "startBoomPayment"),
+  const startPaystackPayment = useMemo(
+    () => httpsCallable(functions, "startPaystackPayment"),
     [],
   );
   const activeType = isSpecialOfferAvailable ? purchaseType : "regular";
@@ -192,20 +194,24 @@ const PurchaseForm = ({ setStatusMessage }) => {
 
     try {
       const payload = {
-        amount: activeBundleDetails.price.toFixed(2),
+        amount: activeBundleDetails.price,
         email: "customeremail@gmail.com",
         desc: activeBundleDetails.desc,
-        redirect: window.location.href,
-        externalref: uuidv4(),
+        callback_url: window.location.href,
+        reference: uuidv4(),
         metadata: {
           ...activeBundleDetails.meta,
           recipient_number: formatPhoneNumber(recipientPhoneNumber),
         },
       };
 
-      const result = await startMoolrePayment(payload);
-      if (result.data?.authorization_url) {
-        paymentWindow.location.href = result.data.authorization_url;
+      const result = await startPaystackPayment(payload);
+      const authorizationUrl = result.data?.authorization_url;
+
+      if (authorizationUrl) {
+        // Safe redirect: URL comes only from our own trusted backend response,
+        // never from user input or third-party content.
+        paymentWindow.location.href = authorizationUrl;
         setStatusMessage("Redirecting to secure payment page...");
       } else {
         throw new Error("No authorization URL received");
@@ -235,7 +241,11 @@ const PurchaseForm = ({ setStatusMessage }) => {
           </div>
           <p className="text-slate-400 text-sm flex items-center gap-2">
             <span className="inline-block w-2 h-2 bg-emerald-500 rounded-full animate-pulse" />
-            Dear Customer, kindly hold on with purchasing of data bundles as we are currently experiencing a temporary outage. We apologize for the inconvenience and appreciate your patience. Our team is actively working to resolve the issue, and we will notify you once the service is restored. Thank you for your understanding.
+            Dear Customer, kindly hold on with purchasing of data bundles as we
+            are currently experiencing a temporary outage. We apologize for the
+            inconvenience and appreciate your patience. Our team is actively
+            working to resolve the issue, and we will notify you once the
+            service is restored. Thank you for your understanding.
           </p>
         </div>
 
@@ -440,8 +450,7 @@ const PurchaseForm = ({ setStatusMessage }) => {
           </motion.button>
 
           <div className="flex items-center justify-center gap-2 text-[11px] text-slate-500 font-medium uppercase tracking-tighter">
-            <FaShieldAlt className="text-emerald-500" /> Secured by Moolre
-            Gateway
+            <FaShieldAlt className="text-emerald-500" /> Secured by Paystack
           </div>
         </form>
       </motion.div>
