@@ -192,6 +192,51 @@ const PurchaseForm = ({ setStatusMessage }) => {
     setIsPaymentLoading(true);
     const paymentWindow = window.open("", "_blank");
 
+    if (paymentWindow) {
+      paymentWindow.document.write(`
+        <!DOCTYPE html>
+        <html>
+          <head>
+            <title>Preparing your payment...</title>
+            <style>
+              body {
+                margin: 0;
+                height: 100vh;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                gap: 16px;
+                background: #020617;
+                color: #e2e8f0;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+              }
+              .spinner {
+                width: 40px;
+                height: 40px;
+                border: 3px solid #1e293b;
+                border-top-color: #6366f1;
+                border-radius: 50%;
+                animation: spin 0.8s linear infinite;
+              }
+              p {
+                font-size: 14px;
+                color: #94a3b8;
+              }
+              @keyframes spin {
+                to { transform: rotate(360deg); }
+              }
+            </style>
+          </head>
+          <body>
+            <div class="spinner"></div>
+            <p>Setting up your secure payment...</p>
+          </body>
+        </html>
+      `);
+      paymentWindow.document.close();
+    }
+
     try {
       const payload = {
         amount: activeBundleDetails.price,
@@ -241,7 +286,8 @@ const PurchaseForm = ({ setStatusMessage }) => {
           </div>
           <p className="text-slate-400 text-sm flex items-center gap-2">
             <span className="inline-block w-2 h-2 bg-emerald-500 rounded-full animate-pulse" />
-            Verified numbers are delivered within 3 minutes to 2 hours, while unverified numbers are delivered within 24 hours.
+            Verified numbers are delivered within 3 minutes to 2 hours, while
+            unverified numbers are delivered within 24 hours.
           </p>
         </div>
 
