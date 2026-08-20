@@ -1,23 +1,16 @@
-import React, { useState, useMemo, useCallback, useRef } from "react";
-import { motion } from "framer-motion";
+import React, { useState, useMemo, useCallback } from "react";
+import { motion, AnimatePresence } from "framer-motion";
 import {
   FaSpinner,
   FaWifi,
   FaMobileAlt,
   FaShieldAlt,
   FaStar,
+  FaTimesCircle,
 } from "react-icons/fa";
 import { v4 as uuidv4 } from "uuid";
 import { httpsCallable } from "firebase/functions";
-import { doc, onSnapshot } from "firebase/firestore";
-// NOTE: this assumes your ../Firebase module exports a Firestore instance
-// named `db`, the same way it exports `functions`. If it's exported under
-// a different name (or not exported at all yet), adjust this import and
-// add the export in ../Firebase — this is required for the live
-// "awaiting approval / paid / failed" status updates below, since
-// TheTeller confirms payment asynchronously with no redirect to come back
-// to.
-import { db, functions } from "../Firebase";
+import { functions } from "../Firebase";
 
 const providersData = {
   mtn: {
@@ -142,15 +135,22 @@ const PurchaseForm = ({ setStatusMessage }) => {
   // Whose MoMo wallet gets charged — can be different from the recipient
   // (e.g. buying a bundle as a gift for someone else).
   const [payerPhoneNumber, setPayerPhoneNumber] = useState("");
-  const [isPaymentLoading, setIsPaymentLoading] = useState(false);
+  const [sameAsRecipient, setSameAsRecipient] = useState(false);
+  const [fieldErrors, setFieldErrors] = useState({ recipient: "", payer: "" });
 
-  const unsubscribeRef = useRef(null);
+  // "idle" | "submitting" | "sent" | "error"
+  // No live tracking of the payment's eventual outcome — once the request
+  // is sent, we just tell the customer to go approve it on their phone.
+  const [paymentPhase, setPaymentPhase] = useState("idle");
+  const [confirmationMessage, setConfirmationMessage] = useState("");
+  const [errorMessage, setErrorMessage] = useState("");
 
   const startTheTellerPayment = useMemo(
     () => httpsCallable(functions, "startTheTellerPayment"),
     [],
   );
   const activeType = isSpecialOfferAvailable ? purchaseType : "regular";
+  const isBusy = paymentPhase !== "idle";
 
   const activeBundleDetails = useMemo(() => {
     if (activeType === "regular") {
@@ -194,83 +194,61 @@ const PurchaseForm = ({ setStatusMessage }) => {
     return formatted;
   }, []);
 
-  // Watches the transaction doc for the async status TheTeller reports via
-  // its callback (pending -> success/delivered, or failed). Stops itself
-  // after a terminal state or after 3 minutes, whichever comes first.
-  const watchTransactionStatus = useCallback(
-    (reference) => {
-      if (unsubscribeRef.current) {
-        unsubscribeRef.current();
-        unsubscribeRef.current = null;
-      }
-
-      const unsub = onSnapshot(
-        doc(db, "boon-transactions", reference),
-        (snap) => {
-          if (!snap.exists()) return;
-          const tx = snap.data();
-
-          if (tx.status === "delivered") {
-            setStatusMessage("Payment successful! Your bundle is on its way.");
-            unsub();
-          } else if (tx.status === "success") {
-            setStatusMessage(
-              "Payment confirmed — delivering your bundle now...",
-            );
-          } else if (tx.status === "failed") {
-            setStatusMessage(
-              tx.tellerCallbackReason ||
-                tx.tellerReason ||
-                "Payment failed or was declined. Please try again.",
-            );
-            unsub();
-          } else if (tx.status === "delivery_failed") {
-            setStatusMessage(
-              "Payment succeeded, but we hit an issue delivering your bundle. Our team has been notified.",
-            );
-            unsub();
-          }
-        },
-        (err) => {
-          console.error("Transaction status listener error:", err);
-        },
-      );
-
-      unsubscribeRef.current = unsub;
-      setTimeout(
-        () => {
-          if (unsubscribeRef.current === unsub) {
-            unsub();
-            unsubscribeRef.current = null;
-          }
-        },
-        3 * 60 * 1000,
+  // Digits-only, capped at 10 chars, as the user types — and clears any
+  // inline error for that field the moment they start correcting it.
+  const handlePhoneInput = useCallback(
+    (setter, errorKey) => (e) => {
+      const digits = e.target.value.replace(/\D/g, "").slice(0, 10);
+      setter(digits);
+      setFieldErrors((prev) =>
+        prev[errorKey] ? { ...prev, [errorKey]: "" } : prev,
       );
     },
-    [setStatusMessage],
+    [],
   );
+
+  const validate = useCallback(() => {
+    const errors = { recipient: "", payer: "" };
+
+    if (!/^0\d{9}$/.test(recipientPhoneNumber)) {
+      errors.recipient = "Enter a valid 10-digit number starting with 0.";
+    }
+
+    const effectivePayer = sameAsRecipient
+      ? recipientPhoneNumber
+      : payerPhoneNumber;
+    if (!/^0\d{9}$/.test(effectivePayer)) {
+      errors.payer = "Enter a valid 10-digit MoMo number starting with 0.";
+    }
+
+    setFieldErrors(errors);
+    return !errors.recipient && !errors.payer;
+  }, [recipientPhoneNumber, payerPhoneNumber, sameAsRecipient]);
+
+  const resetPurchase = useCallback(() => {
+    setPaymentPhase("idle");
+    setConfirmationMessage("");
+    setErrorMessage("");
+  }, []);
 
   const handlePurchase = async (e) => {
     e.preventDefault();
-    if (
-      !activeBundleDetails ||
-      !/^0\d{9}$/.test(payerPhoneNumber) ||
-      !/^0\d{9}$/.test(recipientPhoneNumber)
-    ) {
-      setStatusMessage(
-        "Please check your selections and enter valid 10-digit numbers for both fields.",
-      );
+    if (!activeBundleDetails || !validate()) {
       return;
     }
 
-    setIsPaymentLoading(true);
+    const effectivePayerNumber = sameAsRecipient
+      ? recipientPhoneNumber
+      : payerPhoneNumber;
+
+    setPaymentPhase("submitting");
 
     try {
       const ref = uuidv4();
 
       const payload = {
         amount: activeBundleDetails.price,
-        phone: payerPhoneNumber,
+        phone: effectivePayerNumber,
         desc: activeBundleDetails.desc,
         reference: ref,
         metadata: {
@@ -283,25 +261,27 @@ const PurchaseForm = ({ setStatusMessage }) => {
       const responseData = result.data || {};
 
       if (responseData.status === "already_exists") {
-        setStatusMessage(
-          "This payment was already started. Please wait a moment or try again.",
-        );
+        const message =
+          "This payment was already started. Please wait a moment before trying again.";
+        setErrorMessage(message);
+        setPaymentPhase("error");
+        setStatusMessage(message);
         return;
       }
 
-      setStatusMessage(
+      const message =
         responseData.message ||
-          `Check your phone (${payerPhoneNumber}) and enter your MoMo PIN to approve the payment.`,
-      );
-
-      watchTransactionStatus(ref);
+        `Check your phone (${effectivePayerNumber}) and enter your MoMo PIN to approve the payment.`;
+      setConfirmationMessage(message);
+      setPaymentPhase("sent");
+      setStatusMessage(message);
     } catch (err) {
       console.error("Failed to start payment:", err);
-      setStatusMessage(
-        err.message || "Failed to initiate payment. Please try again.",
-      );
-    } finally {
-      setIsPaymentLoading(false);
+      const message =
+        err.message || "Failed to initiate payment. Please try again.";
+      setErrorMessage(message);
+      setPaymentPhase("error");
+      setStatusMessage(message);
     }
   };
 
@@ -313,7 +293,7 @@ const PurchaseForm = ({ setStatusMessage }) => {
         className="bg-slate-900 rounded-3xl overflow-hidden shadow-2xl border border-slate-800/80"
       >
         {/* Header Section */}
-        <div className="bg-slate-950 p-6 border-b border-slate-800/60">
+        <div className="bg-slate-950 p-5 sm:p-6 border-b border-slate-800/60">
           <div className="flex items-center gap-3 mb-2">
             <div className="bg-indigo-500/10 p-2 rounded-lg">
               <FaWifi className="text-indigo-400 text-xl" />
@@ -327,235 +307,368 @@ const PurchaseForm = ({ setStatusMessage }) => {
           </p>
         </div>
 
-        <form onSubmit={handlePurchase} className="p-6 space-y-6">
-          {/* Service Category Toggle */}
-          <div className="space-y-3">
-            <label className="text-sm font-semibold text-slate-300">
-              Select Offer Type
-            </label>
-            <div className="grid grid-cols-2 gap-3 p-1 bg-slate-950 rounded-xl border border-slate-800">
-              <button
-                type="button"
-                onClick={() => {
-                  setPurchaseType("regular");
-                  setSelectedProvider("mtn");
-                  setSelectedBundleSize("1");
-                }}
-                className={`py-2.5 text-xs font-bold uppercase tracking-wider rounded-lg transition-all ${
-                  activeType === "regular"
-                    ? "bg-indigo-600 text-white shadow-md"
-                    : "text-slate-400 hover:text-slate-200"
-                }`}
-              >
-                Regular Bundles
-              </button>
-
-              <button
-                type="button"
-                disabled={!isSpecialOfferAvailable}
-                onClick={() => {
-                  setPurchaseType("special");
-                  setSelectedProvider("mtn");
-                }}
-                className={`py-2.5 text-xs font-bold uppercase tracking-wider rounded-lg transition-all flex items-center justify-center gap-1.5 relative
-                  ${
-                    !isSpecialOfferAvailable
-                      ? "opacity-30 cursor-not-allowed bg-slate-900 text-slate-500"
-                      : activeType === "special"
-                        ? "bg-amber-500 text-black shadow-md"
-                        : "text-slate-400 hover:text-slate-200"
-                  }`}
-              >
-                <FaStar
-                  className={
-                    activeType === "special" ? "text-black" : "text-slate-500"
-                  }
-                />
-                <span>MTN Special Offers</span>
-                {!isSpecialOfferAvailable && (
-                  <span className="absolute -top-2 -right-1 bg-rose-600 text-white text-[8px] font-medium tracking-tight px-1.5 py-0.5 rounded-full uppercase">
-                    Out of Stock
-                  </span>
-                )}
-              </button>
-            </div>
-          </div>
-
-          {/* Conditional Network Selection */}
-          {activeType === "regular" && (
-            <div className="space-y-3">
-              <label className="text-sm font-semibold text-slate-300">
-                Choose Network
-              </label>
-              <div className="grid grid-cols-3 gap-3">
-                {Object.keys(providersData).map((prov) => (
-                  <button
-                    key={prov}
+        <AnimatePresence mode="wait">
+          {paymentPhase === "idle" || paymentPhase === "submitting" ? (
+            <motion.form
+              key="form"
+              onSubmit={handlePurchase}
+              className="p-5 sm:p-6 space-y-6"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.15 }}
+            >
+              {/* Service Category Toggle */}
+              <div className="space-y-3">
+                <label className="text-sm font-semibold text-slate-300">
+                  Select Offer Type
+                </label>
+                <div className="grid grid-cols-2 gap-3 p-1 bg-slate-950 rounded-xl border border-slate-800">
+                  <motion.button
                     type="button"
+                    whileTap={{ scale: 0.97 }}
+                    disabled={isBusy}
                     onClick={() => {
-                      setSelectedProvider(prov);
-                      setSelectedBundleSize(prov === "telecel" ? "5" : "1");
+                      setPurchaseType("regular");
+                      setSelectedProvider("mtn");
+                      setSelectedBundleSize("1");
                     }}
-                    className={`py-3 rounded-xl border-2 transition-all font-bold text-xs uppercase tracking-wider
+                    className={`py-2.5 text-xs font-bold uppercase tracking-wider rounded-lg transition-all ${
+                      activeType === "regular"
+                        ? "bg-indigo-600 text-white shadow-md"
+                        : "text-slate-400 hover:text-slate-200"
+                    }`}
+                  >
+                    Regular Bundles
+                  </motion.button>
+
+                  <motion.button
+                    type="button"
+                    whileTap={{ scale: 0.97 }}
+                    disabled={!isSpecialOfferAvailable || isBusy}
+                    onClick={() => {
+                      setPurchaseType("special");
+                      setSelectedProvider("mtn");
+                    }}
+                    className={`py-2.5 text-xs font-bold uppercase tracking-wider rounded-lg transition-all flex items-center justify-center gap-1.5 relative
                       ${
-                        selectedProvider === prov
-                          ? `${providersData[prov].border} ${providersData[prov].color} ${providersData[prov].text} shadow-md`
-                          : "border-slate-800 bg-slate-950 text-slate-400 hover:border-slate-700"
+                        !isSpecialOfferAvailable
+                          ? "opacity-30 cursor-not-allowed bg-slate-900 text-slate-500"
+                          : activeType === "special"
+                            ? "bg-amber-500 text-black shadow-md"
+                            : "text-slate-400 hover:text-slate-200"
                       }`}
                   >
-                    {prov}
-                  </button>
-                ))}
+                    <FaStar
+                      className={
+                        activeType === "special"
+                          ? "text-black"
+                          : "text-slate-500"
+                      }
+                    />
+                    <span>MTN Special Offers</span>
+                    {!isSpecialOfferAvailable && (
+                      <span className="absolute -top-2 -right-1 bg-rose-600 text-white text-[8px] font-medium tracking-tight px-1.5 py-0.5 rounded-full uppercase">
+                        Out of Stock
+                      </span>
+                    )}
+                  </motion.button>
+                </div>
               </div>
-            </div>
-          )}
 
-          {/* Conditional Data Plan Select Dropdown */}
-          <div className="space-y-3">
-            <label className="text-sm font-semibold text-slate-300">
-              {activeType === "regular"
-                ? "Select Data Plan"
-                : "Select MTN Special Offer Package"}
-            </label>
-            <div className="relative">
-              {activeType === "regular" ? (
-                <select
-                  value={selectedBundleSize}
-                  onChange={(e) => setSelectedBundleSize(e.target.value)}
-                  className="w-full appearance-none bg-slate-950 border border-slate-800 text-slate-100 rounded-xl px-4 py-3.5 outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition-all cursor-pointer"
-                  required
-                >
-                  {providersData[selectedProvider].bundles.map((b) => (
-                    <option
-                      key={b.gb}
-                      value={b.gb}
-                      className="bg-slate-950 text-slate-100"
-                    >
-                      {b.gb}GB — GHS {b.price.toFixed(2)}
-                    </option>
-                  ))}
-                </select>
-              ) : (
-                <select
-                  value={selectedSpecialId}
-                  onChange={(e) => setSelectedSpecialId(e.target.value)}
-                  className="w-full appearance-none bg-slate-950 border border-amber-500/30 text-slate-100 rounded-xl px-4 py-3.5 outline-none focus:ring-2 focus:ring-amber-500 focus:border-transparent transition-all cursor-pointer"
-                  required
-                >
-                  {mtnSpecialOffers.map((offer) => (
-                    <option
-                      key={offer.id}
-                      value={offer.id}
-                      className="bg-slate-950 text-slate-100"
-                    >
-                      {offer.name} — GHS {Number(offer.cost_price).toFixed(2)}
-                    </option>
-                  ))}
-                </select>
+              {/* Conditional Network Selection */}
+              {activeType === "regular" && (
+                <div className="space-y-3">
+                  <label className="text-sm font-semibold text-slate-300">
+                    Choose Network
+                  </label>
+                  <div className="grid grid-cols-3 gap-3">
+                    {Object.keys(providersData).map((prov) => (
+                      <motion.button
+                        key={prov}
+                        type="button"
+                        whileTap={{ scale: 0.96 }}
+                        disabled={isBusy}
+                        onClick={() => {
+                          setSelectedProvider(prov);
+                          setSelectedBundleSize(prov === "telecel" ? "5" : "1");
+                        }}
+                        className={`py-3 rounded-xl border-2 transition-all font-bold text-xs uppercase tracking-wider
+                          ${
+                            selectedProvider === prov
+                              ? `${providersData[prov].border} ${providersData[prov].color} ${providersData[prov].text} shadow-md`
+                              : "border-slate-800 bg-slate-950 text-slate-400 hover:border-slate-700"
+                          }`}
+                      >
+                        {prov}
+                      </motion.button>
+                    ))}
+                  </div>
+                </div>
               )}
-              <div className="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-slate-500">
-                <svg
-                  className="w-5 h-5"
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth="2"
-                    d="M19 9l-7 7-7-7"
-                  />
-                </svg>
+
+              {/* Conditional Data Plan Select Dropdown */}
+              <div className="space-y-3">
+                <label className="text-sm font-semibold text-slate-300">
+                  {activeType === "regular"
+                    ? "Select Data Plan"
+                    : "Select MTN Special Offer Package"}
+                </label>
+                <div className="relative">
+                  {activeType === "regular" ? (
+                    <select
+                      value={selectedBundleSize}
+                      onChange={(e) => setSelectedBundleSize(e.target.value)}
+                      disabled={isBusy}
+                      className="w-full appearance-none bg-slate-950 border border-slate-800 text-slate-100 rounded-xl px-4 py-3.5 outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition-all cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                      required
+                    >
+                      {providersData[selectedProvider].bundles.map((b) => (
+                        <option
+                          key={b.gb}
+                          value={b.gb}
+                          className="bg-slate-950 text-slate-100"
+                        >
+                          {b.gb}GB — GHS {b.price.toFixed(2)}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <select
+                      value={selectedSpecialId}
+                      onChange={(e) => setSelectedSpecialId(e.target.value)}
+                      disabled={isBusy}
+                      className="w-full appearance-none bg-slate-950 border border-amber-500/30 text-slate-100 rounded-xl px-4 py-3.5 outline-none focus:ring-2 focus:ring-amber-500 focus:border-transparent transition-all cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                      required
+                    >
+                      {mtnSpecialOffers.map((offer) => (
+                        <option
+                          key={offer.id}
+                          value={offer.id}
+                          className="bg-slate-950 text-slate-100"
+                        >
+                          {offer.name} — GHS{" "}
+                          {Number(offer.cost_price).toFixed(2)}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                  <div className="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-slate-500">
+                    <svg
+                      className="w-5 h-5"
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth="2"
+                        d="M19 9l-7 7-7-7"
+                      />
+                    </svg>
+                  </div>
+                </div>
+
+                {activeType === "special" && (
+                  <p className="text-xs text-amber-400 bg-amber-950/20 border border-amber-900/40 p-2.5 rounded-lg">
+                    <strong>Package detail:</strong>{" "}
+                    {
+                      mtnSpecialOffers.find(
+                        (o) => o.id === Number(selectedSpecialId),
+                      )?.description
+                    }
+                  </p>
+                )}
               </div>
-            </div>
 
-            {activeType === "special" && (
-              <p className="text-xs text-amber-400 bg-amber-950/20 border border-amber-900/40 p-2.5 rounded-lg">
-                <strong>Package detail:</strong>{" "}
-                {
-                  mtnSpecialOffers.find(
-                    (o) => o.id === Number(selectedSpecialId),
-                  )?.description
-                }
-              </p>
-            )}
-          </div>
+              {/* Recipient Phone Field */}
+              <div className="space-y-2">
+                <label className="text-sm font-semibold text-slate-300">
+                  Recipient Number
+                </label>
+                <div className="relative">
+                  <span className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-500">
+                    <FaMobileAlt />
+                  </span>
+                  <input
+                    type="tel"
+                    inputMode="numeric"
+                    value={recipientPhoneNumber}
+                    onChange={handlePhoneInput(
+                      setRecipientPhoneNumber,
+                      "recipient",
+                    )}
+                    disabled={isBusy}
+                    placeholder="0541234567"
+                    className={`w-full bg-slate-950 border text-slate-100 rounded-xl pl-11 pr-4 py-3.5 outline-none focus:ring-2 focus:border-transparent transition-all placeholder-slate-600 disabled:opacity-50 disabled:cursor-not-allowed ${
+                      fieldErrors.recipient
+                        ? "border-rose-600 focus:ring-rose-500"
+                        : "border-slate-800 focus:ring-indigo-500"
+                    }`}
+                    maxLength={10}
+                    required
+                  />
+                </div>
+                {fieldErrors.recipient ? (
+                  <p className="text-xs text-rose-400">
+                    {fieldErrors.recipient}
+                  </p>
+                ) : (
+                  <p className="text-[10px] text-slate-500 uppercase tracking-widest font-medium">
+                    The number that receives the data bundle
+                  </p>
+                )}
+              </div>
 
-          {/* Recipient Phone Field */}
-          <div className="space-y-3">
-            <label className="text-sm font-semibold text-slate-300">
-              Recipient Number
-            </label>
-            <div className="relative">
-              <span className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-500">
-                <FaMobileAlt />
-              </span>
-              <input
-                type="tel"
-                value={recipientPhoneNumber}
-                onChange={(e) => setRecipientPhoneNumber(e.target.value)}
-                placeholder="054 123 4567"
-                className="w-full bg-slate-950 border border-slate-800 text-slate-100 rounded-xl pl-11 pr-4 py-3.5 outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition-all placeholder-slate-600"
-                pattern="0[0-9]{9}"
-                maxLength={10}
-                required
-              />
-            </div>
-            <p className="text-[10px] text-slate-500 uppercase tracking-widest font-medium">
-              The number that receives the data bundle
-            </p>
-          </div>
+              {/* Same-as-recipient shortcut */}
+              <label className="flex items-center gap-2.5 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={sameAsRecipient}
+                  disabled={isBusy}
+                  onChange={(e) => {
+                    setSameAsRecipient(e.target.checked);
+                    setFieldErrors((prev) => ({ ...prev, payer: "" }));
+                  }}
+                  className="w-4 h-4 rounded border-slate-700 bg-slate-950 text-indigo-600 focus:ring-indigo-500 focus:ring-offset-slate-900 disabled:opacity-50"
+                />
+                <span className="text-sm text-slate-300">
+                  This is also my MoMo number
+                </span>
+              </label>
 
-          {/* Payer Phone Field */}
-          <div className="space-y-3">
-            <label className="text-sm font-semibold text-slate-300">
-              Your MoMo Number
-            </label>
-            <div className="relative">
-              <span className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-500">
-                <FaMobileAlt />
-              </span>
-              <input
-                type="tel"
-                value={payerPhoneNumber}
-                onChange={(e) => setPayerPhoneNumber(e.target.value)}
-                placeholder="054 123 4567"
-                className="w-full bg-slate-950 border border-slate-800 text-slate-100 rounded-xl pl-11 pr-4 py-3.5 outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition-all placeholder-slate-600"
-                pattern="0[0-9]{9}"
-                maxLength={10}
-                required
-              />
-            </div>
-            <p className="text-[10px] text-slate-500 uppercase tracking-widest font-medium">
-              The MoMo wallet that gets charged — you'll get a PIN prompt here
-            </p>
-          </div>
+              {/* Payer Phone Field */}
+              <AnimatePresence initial={false}>
+                {!sameAsRecipient && (
+                  <motion.div
+                    key="payer-field"
+                    initial={{ opacity: 0, height: 0 }}
+                    animate={{ opacity: 1, height: "auto" }}
+                    exit={{ opacity: 0, height: 0 }}
+                    transition={{ duration: 0.2 }}
+                    className="space-y-2 overflow-hidden"
+                  >
+                    <label className="text-sm font-semibold text-slate-300">
+                      Your MoMo Number
+                    </label>
+                    <div className="relative">
+                      <span className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-500">
+                        <FaMobileAlt />
+                      </span>
+                      <input
+                        type="tel"
+                        inputMode="numeric"
+                        value={payerPhoneNumber}
+                        onChange={handlePhoneInput(
+                          setPayerPhoneNumber,
+                          "payer",
+                        )}
+                        disabled={isBusy}
+                        placeholder="0541234567"
+                        className={`w-full bg-slate-950 border text-slate-100 rounded-xl pl-11 pr-4 py-3.5 outline-none focus:ring-2 focus:border-transparent transition-all placeholder-slate-600 disabled:opacity-50 disabled:cursor-not-allowed ${
+                          fieldErrors.payer
+                            ? "border-rose-600 focus:ring-rose-500"
+                            : "border-slate-800 focus:ring-indigo-500"
+                        }`}
+                        maxLength={10}
+                        required={!sameAsRecipient}
+                      />
+                    </div>
+                    {fieldErrors.payer ? (
+                      <p className="text-xs text-rose-400">
+                        {fieldErrors.payer}
+                      </p>
+                    ) : (
+                      <p className="text-[10px] text-slate-500 uppercase tracking-widest font-medium">
+                        The MoMo wallet that gets charged — you'll get a PIN
+                        prompt here
+                      </p>
+                    )}
+                  </motion.div>
+                )}
+              </AnimatePresence>
 
-          {/* Pay Button */}
-          <motion.button
-            type="submit"
-            disabled={isPaymentLoading || !activeBundleDetails}
-            whileHover={{ y: -2 }}
-            whileTap={{ scale: 0.98 }}
-            className={`w-full font-bold py-4 rounded-xl shadow-lg transition-all flex items-center justify-center gap-2
-              ${
-                activeType === "special"
-                  ? "bg-amber-500 hover:bg-amber-600 text-black disabled:bg-slate-800 disabled:text-slate-600"
-                  : "bg-indigo-600 hover:bg-indigo-700 text-white disabled:bg-slate-800 disabled:text-slate-600"
-              }`}
-          >
-            {isPaymentLoading ? (
-              <FaSpinner className="animate-spin" />
-            ) : (
-              <>Pay GHS {activeBundleDetails?.price?.toFixed(2)}</>
-            )}
-          </motion.button>
+              {/* Pay Button */}
+              <motion.button
+                type="submit"
+                disabled={isBusy || !activeBundleDetails}
+                whileHover={{ y: -2 }}
+                whileTap={{ scale: 0.98 }}
+                className={`w-full font-bold py-4 rounded-xl shadow-lg transition-all flex items-center justify-center gap-2
+                  ${
+                    activeType === "special"
+                      ? "bg-amber-500 hover:bg-amber-600 text-black disabled:bg-slate-800 disabled:text-slate-600"
+                      : "bg-indigo-600 hover:bg-indigo-700 text-white disabled:bg-slate-800 disabled:text-slate-600"
+                  }`}
+              >
+                {paymentPhase === "submitting" ? (
+                  <FaSpinner className="animate-spin" />
+                ) : (
+                  <>Pay GHS {activeBundleDetails?.price?.toFixed(2)}</>
+                )}
+              </motion.button>
 
-          <div className="flex items-center justify-center gap-2 text-[11px] text-slate-500 font-medium uppercase tracking-tighter">
-            <FaShieldAlt className="text-emerald-500" /> Secured by TheTeller
-          </div>
-        </form>
+              <div className="flex items-center justify-center gap-2 text-[11px] text-slate-500 font-medium uppercase tracking-tighter">
+                <FaShieldAlt className="text-emerald-500" /> Secured by
+                TheTeller
+              </div>
+            </motion.form>
+          ) : (
+            <motion.div
+              key="status"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.15 }}
+              className="p-8 flex flex-col items-center text-center gap-4 min-h-[320px] justify-center"
+            >
+              {paymentPhase === "sent" && (
+                <>
+                  <div className="w-16 h-16 rounded-full bg-indigo-500/10 border border-indigo-500/40 flex items-center justify-center">
+                    <FaMobileAlt className="text-indigo-400 text-2xl" />
+                  </div>
+                  <h3 className="text-lg font-bold text-white">
+                    Approve on Your Phone
+                  </h3>
+                  <p className="text-sm text-slate-400 max-w-xs">
+                    {confirmationMessage}
+                  </p>
+                  <motion.button
+                    type="button"
+                    whileTap={{ scale: 0.97 }}
+                    onClick={resetPurchase}
+                    className="mt-2 px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold transition-all"
+                  >
+                    Make Another Purchase
+                  </motion.button>
+                </>
+              )}
+
+              {paymentPhase === "error" && (
+                <>
+                  <div className="w-16 h-16 rounded-full bg-rose-500/10 border border-rose-500/40 flex items-center justify-center">
+                    <FaTimesCircle className="text-rose-400 text-2xl" />
+                  </div>
+                  <h3 className="text-lg font-bold text-white">
+                    Payment Request Failed
+                  </h3>
+                  <p className="text-sm text-slate-400 max-w-xs">
+                    {errorMessage}
+                  </p>
+                  <motion.button
+                    type="button"
+                    whileTap={{ scale: 0.97 }}
+                    onClick={resetPurchase}
+                    className="mt-2 px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold transition-all"
+                  >
+                    Try Again
+                  </motion.button>
+                </>
+              )}
+            </motion.div>
+          )}
+        </AnimatePresence>
       </motion.div>
     </section>
   );
