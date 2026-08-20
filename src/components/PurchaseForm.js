@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useCallback } from "react";
+import React, { useState, useMemo, useCallback, useRef } from "react";
 import { motion } from "framer-motion";
 import {
   FaSpinner,
@@ -9,7 +9,15 @@ import {
 } from "react-icons/fa";
 import { v4 as uuidv4 } from "uuid";
 import { httpsCallable } from "firebase/functions";
-import { functions } from "../Firebase";
+import { doc, onSnapshot } from "firebase/firestore";
+// NOTE: this assumes your ../Firebase module exports a Firestore instance
+// named `db`, the same way it exports `functions`. If it's exported under
+// a different name (or not exported at all yet), adjust this import and
+// add the export in ../Firebase — this is required for the live
+// "awaiting approval / paid / failed" status updates below, since
+// TheTeller confirms payment asynchronously with no redirect to come back
+// to.
+import { db, functions } from "../Firebase";
 
 const providersData = {
   mtn: {
@@ -129,11 +137,17 @@ const PurchaseForm = ({ setStatusMessage }) => {
   const [selectedSpecialId, setSelectedSpecialId] = useState(
     mtnSpecialOffers[0].id.toString(),
   );
+  // Who receives the data bundle.
   const [recipientPhoneNumber, setRecipientPhoneNumber] = useState("");
+  // Whose MoMo wallet gets charged — can be different from the recipient
+  // (e.g. buying a bundle as a gift for someone else).
+  const [payerPhoneNumber, setPayerPhoneNumber] = useState("");
   const [isPaymentLoading, setIsPaymentLoading] = useState(false);
 
-  const startPaystackPayment = useMemo(
-    () => httpsCallable(functions, "startPaystackPayment"),
+  const unsubscribeRef = useRef(null);
+
+  const startTheTellerPayment = useMemo(
+    () => httpsCallable(functions, "startTheTellerPayment"),
     [],
   );
   const activeType = isSpecialOfferAvailable ? purchaseType : "regular";
@@ -180,90 +194,112 @@ const PurchaseForm = ({ setStatusMessage }) => {
     return formatted;
   }, []);
 
+  // Watches the transaction doc for the async status TheTeller reports via
+  // its callback (pending -> success/delivered, or failed). Stops itself
+  // after a terminal state or after 3 minutes, whichever comes first.
+  const watchTransactionStatus = useCallback(
+    (reference) => {
+      if (unsubscribeRef.current) {
+        unsubscribeRef.current();
+        unsubscribeRef.current = null;
+      }
+
+      const unsub = onSnapshot(
+        doc(db, "boon-transactions", reference),
+        (snap) => {
+          if (!snap.exists()) return;
+          const tx = snap.data();
+
+          if (tx.status === "delivered") {
+            setStatusMessage("Payment successful! Your bundle is on its way.");
+            unsub();
+          } else if (tx.status === "success") {
+            setStatusMessage(
+              "Payment confirmed — delivering your bundle now...",
+            );
+          } else if (tx.status === "failed") {
+            setStatusMessage(
+              tx.tellerCallbackReason ||
+                tx.tellerReason ||
+                "Payment failed or was declined. Please try again.",
+            );
+            unsub();
+          } else if (tx.status === "delivery_failed") {
+            setStatusMessage(
+              "Payment succeeded, but we hit an issue delivering your bundle. Our team has been notified.",
+            );
+            unsub();
+          }
+        },
+        (err) => {
+          console.error("Transaction status listener error:", err);
+        },
+      );
+
+      unsubscribeRef.current = unsub;
+      setTimeout(
+        () => {
+          if (unsubscribeRef.current === unsub) {
+            unsub();
+            unsubscribeRef.current = null;
+          }
+        },
+        3 * 60 * 1000,
+      );
+    },
+    [setStatusMessage],
+  );
+
   const handlePurchase = async (e) => {
     e.preventDefault();
-    if (!activeBundleDetails || !/^\d{10}$/.test(recipientPhoneNumber)) {
+    if (
+      !activeBundleDetails ||
+      !/^0\d{9}$/.test(payerPhoneNumber) ||
+      !/^0\d{9}$/.test(recipientPhoneNumber)
+    ) {
       setStatusMessage(
-        "Please check your selections and enter a valid 10-digit number.",
+        "Please check your selections and enter valid 10-digit numbers for both fields.",
       );
       return;
     }
 
     setIsPaymentLoading(true);
-    const paymentWindow = window.open("", "_blank");
-
-    if (paymentWindow) {
-      paymentWindow.document.write(`
-        <!DOCTYPE html>
-        <html>
-          <head>
-            <title>Preparing your payment...</title>
-            <style>
-              body {
-                margin: 0;
-                height: 100vh;
-                display: flex;
-                flex-direction: column;
-                align-items: center;
-                justify-content: center;
-                gap: 16px;
-                background: #020617;
-                color: #e2e8f0;
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-              }
-              .spinner {
-                width: 40px;
-                height: 40px;
-                border: 3px solid #1e293b;
-                border-top-color: #6366f1;
-                border-radius: 50%;
-                animation: spin 0.8s linear infinite;
-              }
-              p {
-                font-size: 14px;
-                color: #94a3b8;
-              }
-              @keyframes spin {
-                to { transform: rotate(360deg); }
-              }
-            </style>
-          </head>
-          <body>
-            <div class="spinner"></div>
-            <p>Setting up your secure payment...</p>
-          </body>
-        </html>
-      `);
-      paymentWindow.document.close();
-    }
 
     try {
+      const ref = uuidv4();
+
       const payload = {
         amount: activeBundleDetails.price,
-        email: "customeremail@gmail.com",
+        phone: payerPhoneNumber,
         desc: activeBundleDetails.desc,
-        callback_url: window.location.href,
-        reference: uuidv4(),
+        reference: ref,
         metadata: {
           ...activeBundleDetails.meta,
           recipient_number: formatPhoneNumber(recipientPhoneNumber),
         },
       };
 
-      const result = await startPaystackPayment(payload);
-      const authorizationUrl = result.data?.authorization_url;
+      const result = await startTheTellerPayment(payload);
+      const responseData = result.data || {};
 
-      if (authorizationUrl) {
-        // Safe redirect: URL comes only from our own trusted backend response,
-        // never from user input or third-party content.
-        paymentWindow.location.href = authorizationUrl;
-        setStatusMessage("Redirecting to secure payment page...");
-      } else {
-        throw new Error("No authorization URL received");
+      if (responseData.status === "already_exists") {
+        setStatusMessage(
+          "This payment was already started. Please wait a moment or try again.",
+        );
+        return;
       }
+
+      setStatusMessage(
+        responseData.message ||
+          `Check your phone (${payerPhoneNumber}) and enter your MoMo PIN to approve the payment.`,
+      );
+
+      watchTransactionStatus(ref);
     } catch (err) {
-      setStatusMessage("Failed to initiate payment. Please try again.");
-      if (paymentWindow) paymentWindow.close();
+      console.error("Failed to start payment:", err);
+      setStatusMessage(
+        err.message || "Failed to initiate payment. Please try again.",
+      );
     } finally {
       setIsPaymentLoading(false);
     }
@@ -461,13 +497,38 @@ const PurchaseForm = ({ setStatusMessage }) => {
                 onChange={(e) => setRecipientPhoneNumber(e.target.value)}
                 placeholder="054 123 4567"
                 className="w-full bg-slate-950 border border-slate-800 text-slate-100 rounded-xl pl-11 pr-4 py-3.5 outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition-all placeholder-slate-600"
-                pattern="[0-9]{10}"
+                pattern="0[0-9]{9}"
                 maxLength={10}
                 required
               />
             </div>
             <p className="text-[10px] text-slate-500 uppercase tracking-widest font-medium">
-              Must be a 10-digit Ghana number
+              The number that receives the data bundle
+            </p>
+          </div>
+
+          {/* Payer Phone Field */}
+          <div className="space-y-3">
+            <label className="text-sm font-semibold text-slate-300">
+              Your MoMo Number
+            </label>
+            <div className="relative">
+              <span className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-500">
+                <FaMobileAlt />
+              </span>
+              <input
+                type="tel"
+                value={payerPhoneNumber}
+                onChange={(e) => setPayerPhoneNumber(e.target.value)}
+                placeholder="054 123 4567"
+                className="w-full bg-slate-950 border border-slate-800 text-slate-100 rounded-xl pl-11 pr-4 py-3.5 outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition-all placeholder-slate-600"
+                pattern="0[0-9]{9}"
+                maxLength={10}
+                required
+              />
+            </div>
+            <p className="text-[10px] text-slate-500 uppercase tracking-widest font-medium">
+              The MoMo wallet that gets charged — you'll get a PIN prompt here
             </p>
           </div>
 
@@ -492,7 +553,7 @@ const PurchaseForm = ({ setStatusMessage }) => {
           </motion.button>
 
           <div className="flex items-center justify-center gap-2 text-[11px] text-slate-500 font-medium uppercase tracking-tighter">
-            <FaShieldAlt className="text-emerald-500" /> Secured by Paystack
+            <FaShieldAlt className="text-emerald-500" /> Secured by TheTeller
           </div>
         </form>
       </motion.div>
