@@ -8,7 +8,7 @@ const WhatsAppFloat = () => {
       <span className="absolute inline-flex h-full w-full rounded-full bg-green-500 opacity-20 animate-ping"></span>
 
       <motion.a
-        href="https://wa.me/233549856098"
+        href="https://wa.me/+1234567890"  // Replace with your WhatsApp number
         target="_blank"
         rel="noopener noreferrer"
         className="relative flex items-center justify-center w-14 h-14 bg-[#25D366] text-white rounded-full shadow-xl shadow-green-950/20 transition-shadow"
