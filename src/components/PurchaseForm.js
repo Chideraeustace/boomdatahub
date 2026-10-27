@@ -1,4 +1,10 @@
-import React, { useState, useMemo, useCallback } from "react";
+import React, {
+  useState,
+  useMemo,
+  useCallback,
+  useEffect,
+  useRef,
+} from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   FaSpinner,
@@ -7,6 +13,8 @@ import {
   FaShieldAlt,
   FaStar,
   FaTimesCircle,
+  FaCheckCircle,
+  FaClock,
 } from "react-icons/fa";
 import { v4 as uuidv4 } from "uuid";
 import { httpsCallable } from "firebase/functions";
@@ -47,8 +55,8 @@ const providersData = {
       { gb: 6, price: 39.0 },
       { gb: 7, price: 33.0 },
       { gb: 8, price: 38.0 },
-      { gb: 10, price: 45.0 },
       { gb: 9, price: 40.0 },
+      { gb: 10, price: 45.0 },
       { gb: 15, price: 65.0 },
       { gb: 20, price: 85.0 },
     ],
@@ -73,7 +81,6 @@ const providersData = {
 const mtnSpecialOffers = [
   {
     id: 24,
-    special_offer_package_id: 24,
     slug: "1.7gb",
     name: "1.7 GB",
     description: "Single MashUp cycle — 1746.92MB Only",
@@ -81,7 +88,6 @@ const mtnSpecialOffers = [
   },
   {
     id: 26,
-    special_offer_package_id: 26,
     slug: "2.6gb-mins",
     name: "2.6 GB + 1,077 mins",
     description: "Three 873.46MB bundle cycles — approx 2.6 GB + mins",
@@ -89,7 +95,6 @@ const mtnSpecialOffers = [
   },
   {
     id: 34,
-    special_offer_package_id: 34,
     slug: "3.4gb",
     name: "3.4 GB",
     description: "Two MashUp cycles on 1.7 GB base — approx 3.4 GB",
@@ -97,7 +102,6 @@ const mtnSpecialOffers = [
   },
   {
     id: 25,
-    special_offer_package_id: 25,
     slug: "5.1gb-12",
     name: "5.1 GB",
     description: "Three 1.7 GB MashUp cycles — approx 5.1 GB",
@@ -105,7 +109,6 @@ const mtnSpecialOffers = [
   },
   {
     id: 27,
-    special_offer_package_id: 27,
     slug: "7.2gb-15",
     name: "7.2 GB",
     description: "Four 1806.56MB bundle cycles — approx 7.2 GB",
@@ -113,13 +116,71 @@ const mtnSpecialOffers = [
   },
   {
     id: 31,
-    special_offer_package_id: 31,
     slug: "10.2gb",
     name: "10.2 GB",
     description: "Six MashUp cycles on 1.7 GB base — approx 10.2 GB",
     cost_price: "30",
   },
 ];
+
+const PENDING_REF_KEY = "moolre_pending_ref";
+
+const safeStorage = {
+  get: (k) => {
+    try {
+      return window.sessionStorage.getItem(k);
+    } catch {
+      return null;
+    }
+  },
+  set: (k, v) => {
+    try {
+      window.sessionStorage.setItem(k, v);
+    } catch {}
+  },
+  remove: (k) => {
+    try {
+      window.sessionStorage.removeItem(k);
+    } catch {}
+  },
+};
+
+// Server status → what the customer sees.
+const RESULT_COPY = {
+  delivered: {
+    phase: "done",
+    title: "Payment Received",
+    message: "Your bundle is on its way to the recipient number.",
+  },
+  success: {
+    phase: "done",
+    title: "Payment Received",
+    message: "Payment confirmed. Your bundle is being delivered now.",
+  },
+  delivery_failed: {
+    phase: "done",
+    title: "Payment Received",
+    message:
+      "Payment confirmed, but delivery is delayed. We'll complete it shortly — no need to pay again.",
+  },
+  pending: {
+    phase: "pending",
+    title: "Waiting for Payment",
+    message:
+      "We haven't received confirmation yet. If you approved the prompt, give it a moment and check again.",
+  },
+  failed: {
+    phase: "error",
+    title: "Payment Not Completed",
+    message: "The payment was declined or cancelled. You haven't been charged.",
+  },
+  amount_mismatch: {
+    phase: "error",
+    title: "Payment Needs Review",
+    message:
+      "The amount paid didn't match the order. Please contact support with your reference.",
+  },
+};
 
 const PurchaseForm = ({ setStatusMessage }) => {
   const isSpecialOfferAvailable = false;
@@ -130,27 +191,34 @@ const PurchaseForm = ({ setStatusMessage }) => {
   const [selectedSpecialId, setSelectedSpecialId] = useState(
     mtnSpecialOffers[0].id.toString(),
   );
-  // Who receives the data bundle.
   const [recipientPhoneNumber, setRecipientPhoneNumber] = useState("");
-  // Whose MoMo wallet gets charged — can be different from the recipient
-  // (e.g. buying a bundle as a gift for someone else).
-  const [payerPhoneNumber, setPayerPhoneNumber] = useState("");
-  const [sameAsRecipient, setSameAsRecipient] = useState(false);
-  const [fieldErrors, setFieldErrors] = useState({ recipient: "", payer: "" });
+  const [fieldError, setFieldError] = useState("");
 
-  // "idle" | "submitting" | "sent" | "error"
-  // No live tracking of the payment's eventual outcome — once the request
-  // is sent, we just tell the customer to go approve it on their phone.
+  // "idle" | "submitting" | "redirecting" | "verifying" | "done" | "pending" | "error"
   const [paymentPhase, setPaymentPhase] = useState("idle");
-  const [confirmationMessage, setConfirmationMessage] = useState("");
-  const [errorMessage, setErrorMessage] = useState("");
+  const [result, setResult] = useState({ title: "", message: "" });
+  const [pendingRef, setPendingRef] = useState(null);
 
-  const startTheTellerPayment = useMemo(
-    () => httpsCallable(functions, "startTheTellerPayment"),
+  const startMoolrePayment = useMemo(
+    () => httpsCallable(functions, "startMoolrePayment"),
     [],
   );
+  const verifyMoolrePayment = useMemo(
+    () => httpsCallable(functions, "verifyMoolrePayment"),
+    [],
+  );
+
   const activeType = isSpecialOfferAvailable ? purchaseType : "regular";
   const isBusy = paymentPhase !== "idle";
+
+  const report = useCallback(
+    (phase, title, message) => {
+      setPaymentPhase(phase);
+      setResult({ title, message });
+      setStatusMessage?.(message);
+    },
+    [setStatusMessage],
+  );
 
   const activeBundleDetails = useMemo(() => {
     if (activeType === "regular") {
@@ -164,126 +232,136 @@ const PurchaseForm = ({ setStatusMessage }) => {
             meta: {
               type: "data_bundle",
               provider: selectedProvider.toUpperCase(),
-            },
-          }
-        : null;
-    } else {
-      const offer = mtnSpecialOffers.find(
-        (o) => o.id === Number(selectedSpecialId),
-      );
-      return offer
-        ? {
-            price: Number(offer.cost_price),
-            desc: `MTN Special: ${offer.name} (${offer.description})`,
-            meta: {
-              type: "special_offer",
-              provider: "MTN",
-              package_id: offer.id,
-              slug: offer.slug,
+              gb: bundle.gb,
             },
           }
         : null;
     }
+    const offer = mtnSpecialOffers.find(
+      (o) => o.id === Number(selectedSpecialId),
+    );
+    return offer
+      ? {
+          price: Number(offer.cost_price),
+          desc: `MTN Special: ${offer.name}`,
+          meta: {
+            type: "special_offer",
+            provider: "MTN",
+            package_id: offer.id,
+            slug: offer.slug,
+          },
+        }
+      : null;
   }, [activeType, selectedProvider, selectedBundleSize, selectedSpecialId]);
 
-  const formatPhoneNumber = useCallback((phone) => {
-    let formatted = phone.trim();
-    if (formatted.startsWith("0") && formatted.length === 10)
-      return `233${formatted.slice(1)}`;
-    if (formatted.length === 9) return `233${formatted}`;
-    return formatted;
-  }, []);
+  const formatPhoneNumber = (phone) => `233${phone.trim().slice(1)}`;
 
-  // Digits-only, capped at 10 chars, as the user types — and clears any
-  // inline error for that field the moment they start correcting it.
-  const handlePhoneInput = useCallback(
-    (setter, errorKey) => (e) => {
-      const digits = e.target.value.replace(/\D/g, "").slice(0, 10);
-      setter(digits);
-      setFieldErrors((prev) =>
-        prev[errorKey] ? { ...prev, [errorKey]: "" } : prev,
-      );
+  /* ------------- Check payment when returning from Moolre ------------- */
+  const verifyPayment = useCallback(
+    async (reference) => {
+      setPendingRef(reference);
+      setPaymentPhase("verifying");
+      try {
+        const { data } = await verifyMoolrePayment({ reference });
+        const copy = RESULT_COPY[data?.status] || RESULT_COPY.pending;
+        if (copy.phase !== "pending") safeStorage.remove(PENDING_REF_KEY);
+        report(copy.phase, copy.title, copy.message);
+      } catch (err) {
+        console.error("Failed to verify payment:", err);
+        if (err.code === "functions/not-found") {
+          safeStorage.remove(PENDING_REF_KEY);
+          report("error", "Order Not Found", err.message);
+        } else {
+          report(
+            "pending",
+            "Couldn't Check Payment",
+            err.message || "Please try checking again in a moment.",
+          );
+        }
+      }
     },
-    [],
+    [verifyMoolrePayment, report],
   );
 
-  const validate = useCallback(() => {
-    const errors = { recipient: "", payer: "" };
+  const checkedOnLoad = useRef(false);
+  useEffect(() => {
+    if (checkedOnLoad.current) return;
+    checkedOnLoad.current = true;
 
-    if (!/^0\d{9}$/.test(recipientPhoneNumber)) {
-      errors.recipient = "Enter a valid 10-digit number starting with 0.";
+    const params = new URLSearchParams(window.location.search);
+    const ref = params.get("ref") || safeStorage.get(PENDING_REF_KEY);
+    if (!ref) return;
+
+    if (params.has("ref")) {
+      params.delete("ref");
+      const qs = params.toString();
+      window.history.replaceState(
+        null,
+        "",
+        `${window.location.pathname}${qs ? `?${qs}` : ""}${window.location.hash}`,
+      );
     }
+    verifyPayment(ref);
+  }, [verifyPayment]);
 
-    const effectivePayer = sameAsRecipient
-      ? recipientPhoneNumber
-      : payerPhoneNumber;
-    if (!/^0\d{9}$/.test(effectivePayer)) {
-      errors.payer = "Enter a valid 10-digit MoMo number starting with 0.";
-    }
-
-    setFieldErrors(errors);
-    return !errors.recipient && !errors.payer;
-  }, [recipientPhoneNumber, payerPhoneNumber, sameAsRecipient]);
+  const handlePhoneInput = (e) => {
+    setRecipientPhoneNumber(e.target.value.replace(/\D/g, "").slice(0, 10));
+    if (fieldError) setFieldError("");
+  };
 
   const resetPurchase = useCallback(() => {
+    safeStorage.remove(PENDING_REF_KEY);
+    setPendingRef(null);
     setPaymentPhase("idle");
-    setConfirmationMessage("");
-    setErrorMessage("");
+    setResult({ title: "", message: "" });
   }, []);
 
   const handlePurchase = async (e) => {
     e.preventDefault();
-    if (!activeBundleDetails || !validate()) {
+    if (!activeBundleDetails) return;
+    if (!/^0\d{9}$/.test(recipientPhoneNumber)) {
+      setFieldError("Enter a valid 10-digit number starting with 0.");
       return;
     }
-
-    const effectivePayerNumber = sameAsRecipient
-      ? recipientPhoneNumber
-      : payerPhoneNumber;
 
     setPaymentPhase("submitting");
 
     try {
-      const ref = uuidv4();
-
-      const payload = {
+      const reference = uuidv4();
+      const { data } = await startMoolrePayment({
         amount: activeBundleDetails.price,
-        phone: effectivePayerNumber,
         desc: activeBundleDetails.desc,
-        reference: ref,
+        reference,
         metadata: {
           ...activeBundleDetails.meta,
           recipient_number: formatPhoneNumber(recipientPhoneNumber),
         },
-      };
+      });
 
-      const result = await startTheTellerPayment(payload);
-      const responseData = result.data || {};
-
-      if (responseData.status === "already_exists") {
-        const message =
-          "This payment was already started. Please wait a moment before trying again.";
-        setErrorMessage(message);
-        setPaymentPhase("error");
-        setStatusMessage(message);
+      if (data?.authorization_url) {
+        // Remember the order in case Moolre's redirect drops the ref param.
+        safeStorage.set(PENDING_REF_KEY, data.reference || reference);
+        setPaymentPhase("redirecting");
+        window.location.assign(data.authorization_url);
         return;
       }
 
-      const message =
-        responseData.message ||
-        `Check your phone (${effectivePayerNumber}) and enter your MoMo PIN to approve the payment.`;
-      setConfirmationMessage(message);
-      setPaymentPhase("sent");
-      setStatusMessage(message);
+      report(
+        "error",
+        "Payment Request Failed",
+        data?.message || "Couldn't open the payment page. Please try again.",
+      );
     } catch (err) {
       console.error("Failed to start payment:", err);
-      const message =
-        err.message || "Failed to initiate payment. Please try again.";
-      setErrorMessage(message);
-      setPaymentPhase("error");
-      setStatusMessage(message);
+      report(
+        "error",
+        "Payment Request Failed",
+        err.message || "Failed to initiate payment. Please try again.",
+      );
     }
   };
+
+  const showForm = ["idle", "submitting", "redirecting"].includes(paymentPhase);
 
   return (
     <section className="w-full max-w-lg mx-auto">
@@ -308,7 +386,7 @@ const PurchaseForm = ({ setStatusMessage }) => {
         </div>
 
         <AnimatePresence mode="wait">
-          {paymentPhase === "idle" || paymentPhase === "submitting" ? (
+          {showForm ? (
             <motion.form
               key="form"
               onSubmit={handlePurchase}
@@ -376,7 +454,7 @@ const PurchaseForm = ({ setStatusMessage }) => {
                 </div>
               </div>
 
-              {/* Conditional Network Selection */}
+              {/* Network Selection */}
               {activeType === "regular" && (
                 <div className="space-y-3">
                   <label className="text-sm font-semibold text-slate-300">
@@ -407,7 +485,7 @@ const PurchaseForm = ({ setStatusMessage }) => {
                 </div>
               )}
 
-              {/* Conditional Data Plan Select Dropdown */}
+              {/* Data Plan Select */}
               <div className="space-y-3">
                 <label className="text-sm font-semibold text-slate-300">
                   {activeType === "regular"
@@ -495,14 +573,11 @@ const PurchaseForm = ({ setStatusMessage }) => {
                     type="tel"
                     inputMode="numeric"
                     value={recipientPhoneNumber}
-                    onChange={handlePhoneInput(
-                      setRecipientPhoneNumber,
-                      "recipient",
-                    )}
+                    onChange={handlePhoneInput}
                     disabled={isBusy}
                     placeholder="0541234567"
                     className={`w-full bg-slate-950 border text-slate-100 rounded-xl pl-11 pr-4 py-3.5 outline-none focus:ring-2 focus:border-transparent transition-all placeholder-slate-600 disabled:opacity-50 disabled:cursor-not-allowed ${
-                      fieldErrors.recipient
+                      fieldError
                         ? "border-rose-600 focus:ring-rose-500"
                         : "border-slate-800 focus:ring-indigo-500"
                     }`}
@@ -510,10 +585,8 @@ const PurchaseForm = ({ setStatusMessage }) => {
                     required
                   />
                 </div>
-                {fieldErrors.recipient ? (
-                  <p className="text-xs text-rose-400">
-                    {fieldErrors.recipient}
-                  </p>
+                {fieldError ? (
+                  <p className="text-xs text-rose-400">{fieldError}</p>
                 ) : (
                   <p className="text-[10px] text-slate-500 uppercase tracking-widest font-medium">
                     The number that receives the data bundle
@@ -521,73 +594,10 @@ const PurchaseForm = ({ setStatusMessage }) => {
                 )}
               </div>
 
-              {/* Same-as-recipient shortcut */}
-              <label className="flex items-center gap-2.5 cursor-pointer select-none">
-                <input
-                  type="checkbox"
-                  checked={sameAsRecipient}
-                  disabled={isBusy}
-                  onChange={(e) => {
-                    setSameAsRecipient(e.target.checked);
-                    setFieldErrors((prev) => ({ ...prev, payer: "" }));
-                  }}
-                  className="w-4 h-4 rounded border-slate-700 bg-slate-950 text-indigo-600 focus:ring-indigo-500 focus:ring-offset-slate-900 disabled:opacity-50"
-                />
-                <span className="text-sm text-slate-300">
-                  This is also my MoMo number
-                </span>
-              </label>
-
-              {/* Payer Phone Field */}
-              <AnimatePresence initial={false}>
-                {!sameAsRecipient && (
-                  <motion.div
-                    key="payer-field"
-                    initial={{ opacity: 0, height: 0 }}
-                    animate={{ opacity: 1, height: "auto" }}
-                    exit={{ opacity: 0, height: 0 }}
-                    transition={{ duration: 0.2 }}
-                    className="space-y-2 overflow-hidden"
-                  >
-                    <label className="text-sm font-semibold text-slate-300">
-                      Your MoMo Number
-                    </label>
-                    <div className="relative">
-                      <span className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-500">
-                        <FaMobileAlt />
-                      </span>
-                      <input
-                        type="tel"
-                        inputMode="numeric"
-                        value={payerPhoneNumber}
-                        onChange={handlePhoneInput(
-                          setPayerPhoneNumber,
-                          "payer",
-                        )}
-                        disabled={isBusy}
-                        placeholder="0541234567"
-                        className={`w-full bg-slate-950 border text-slate-100 rounded-xl pl-11 pr-4 py-3.5 outline-none focus:ring-2 focus:border-transparent transition-all placeholder-slate-600 disabled:opacity-50 disabled:cursor-not-allowed ${
-                          fieldErrors.payer
-                            ? "border-rose-600 focus:ring-rose-500"
-                            : "border-slate-800 focus:ring-indigo-500"
-                        }`}
-                        maxLength={10}
-                        required={!sameAsRecipient}
-                      />
-                    </div>
-                    {fieldErrors.payer ? (
-                      <p className="text-xs text-rose-400">
-                        {fieldErrors.payer}
-                      </p>
-                    ) : (
-                      <p className="text-[10px] text-slate-500 uppercase tracking-widest font-medium">
-                        The MoMo wallet that gets charged — you'll get a PIN
-                        prompt here
-                      </p>
-                    )}
-                  </motion.div>
-                )}
-              </AnimatePresence>
+              <p className="text-xs text-slate-400 bg-slate-950 border border-slate-800 p-3 rounded-lg">
+                You'll be taken to Moolre's secure page to pay with Mobile
+                Money. You can pay from any MoMo wallet.
+              </p>
 
               {/* Pay Button */}
               <motion.button
@@ -604,14 +614,17 @@ const PurchaseForm = ({ setStatusMessage }) => {
               >
                 {paymentPhase === "submitting" ? (
                   <FaSpinner className="animate-spin" />
+                ) : paymentPhase === "redirecting" ? (
+                  <>
+                    <FaSpinner className="animate-spin" /> Opening payment page…
+                  </>
                 ) : (
                   <>Pay GHS {activeBundleDetails?.price?.toFixed(2)}</>
                 )}
               </motion.button>
 
               <div className="flex items-center justify-center gap-2 text-[11px] text-slate-500 font-medium uppercase tracking-tighter">
-                <FaShieldAlt className="text-emerald-500" /> Secured by
-                TheTeller
+                <FaShieldAlt className="text-emerald-500" /> Secured by Moolre
               </div>
             </motion.form>
           ) : (
@@ -623,47 +636,67 @@ const PurchaseForm = ({ setStatusMessage }) => {
               transition={{ duration: 0.15 }}
               className="p-8 flex flex-col items-center text-center gap-4 min-h-[320px] justify-center"
             >
-              {paymentPhase === "sent" && (
+              {paymentPhase === "verifying" ? (
                 <>
-                  <div className="w-16 h-16 rounded-full bg-indigo-500/10 border border-indigo-500/40 flex items-center justify-center">
-                    <FaMobileAlt className="text-indigo-400 text-2xl" />
-                  </div>
+                  <FaSpinner className="animate-spin text-indigo-400 text-3xl" />
                   <h3 className="text-lg font-bold text-white">
-                    Approve on Your Phone
+                    Checking your payment…
                   </h3>
-                  <p className="text-sm text-slate-400 max-w-xs">
-                    {confirmationMessage}
-                  </p>
-                  <motion.button
-                    type="button"
-                    whileTap={{ scale: 0.97 }}
-                    onClick={resetPurchase}
-                    className="mt-2 px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold transition-all"
-                  >
-                    Make Another Purchase
-                  </motion.button>
                 </>
-              )}
-
-              {paymentPhase === "error" && (
+              ) : (
                 <>
-                  <div className="w-16 h-16 rounded-full bg-rose-500/10 border border-rose-500/40 flex items-center justify-center">
-                    <FaTimesCircle className="text-rose-400 text-2xl" />
+                  <div
+                    className={`w-16 h-16 rounded-full flex items-center justify-center border ${
+                      paymentPhase === "done"
+                        ? "bg-emerald-500/10 border-emerald-500/40"
+                        : paymentPhase === "pending"
+                          ? "bg-amber-500/10 border-amber-500/40"
+                          : "bg-rose-500/10 border-rose-500/40"
+                    }`}
+                  >
+                    {paymentPhase === "done" && (
+                      <FaCheckCircle className="text-emerald-400 text-2xl" />
+                    )}
+                    {paymentPhase === "pending" && (
+                      <FaClock className="text-amber-400 text-2xl" />
+                    )}
+                    {paymentPhase === "error" && (
+                      <FaTimesCircle className="text-rose-400 text-2xl" />
+                    )}
                   </div>
                   <h3 className="text-lg font-bold text-white">
-                    Payment Request Failed
+                    {result.title}
                   </h3>
                   <p className="text-sm text-slate-400 max-w-xs">
-                    {errorMessage}
+                    {result.message}
                   </p>
-                  <motion.button
-                    type="button"
-                    whileTap={{ scale: 0.97 }}
-                    onClick={resetPurchase}
-                    className="mt-2 px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold transition-all"
-                  >
-                    Try Again
-                  </motion.button>
+                  {pendingRef && (
+                    <p className="text-[10px] text-slate-600 break-all">
+                      Ref: {pendingRef}
+                    </p>
+                  )}
+                  <div className="flex gap-3 mt-2">
+                    {paymentPhase === "pending" && pendingRef && (
+                      <motion.button
+                        type="button"
+                        whileTap={{ scale: 0.97 }}
+                        onClick={() => verifyPayment(pendingRef)}
+                        className="px-5 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-600 text-black text-sm font-semibold transition-all"
+                      >
+                        Check Again
+                      </motion.button>
+                    )}
+                    <motion.button
+                      type="button"
+                      whileTap={{ scale: 0.97 }}
+                      onClick={resetPurchase}
+                      className="px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold transition-all"
+                    >
+                      {paymentPhase === "error"
+                        ? "Try Again"
+                        : "Make Another Purchase"}
+                    </motion.button>
+                  </div>
                 </>
               )}
             </motion.div>
